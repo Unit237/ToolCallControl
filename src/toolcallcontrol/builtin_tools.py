@@ -1,6 +1,10 @@
-"""Example server-side tool implementations. Only the control plane runs these."""
+"""Reference server-side tool implementations used by the default demo registry."""
+
+from __future__ import annotations
 
 from typing import Any
+
+from .exceptions import ExecutionError
 
 
 def run_add(a: float, b: float) -> float:
@@ -8,14 +12,13 @@ def run_add(a: float, b: float) -> float:
 
 
 def run_search(query: str, corpus: str = "default") -> str:
-    # Mock: in reality would call a search API
     return f"[{corpus}] results for: {query}"
 
 
 def execute_server_tool(tool_id: str, args: dict[str, Any]) -> Any:
-    """Dispatch to the right server tool. Control plane calls this only after constraint check."""
+    """Dispatch to a built-in server tool after policy approval."""
     if tool_id == "add":
         return run_add(args["a"], args["b"])
     if tool_id == "search":
         return run_search(args.get("query", ""), args.get("corpus", "default"))
-    raise ValueError(f"Unknown server tool: {tool_id}")
+    raise ExecutionError(f"Unknown server tool: {tool_id}")

@@ -1,11 +1,11 @@
-"""Constraint pipeline: allowlist by profile, optional denylist. Control plane calls this before execute."""
+"""Constraint pipeline: allowlist by profile; extend with more checks."""
 
-from .model import Decision, Proposal, Venue
+from .model import Decision, Proposal
 from .tool_registry import ToolRegistry
 
 
 class ConstraintPipeline:
-    """Check a proposal against policy. Returns allow or reject with reason."""
+    """Check a proposal against policy before execution."""
 
     def __init__(self, registry: ToolRegistry) -> None:
         self.registry = registry
@@ -14,7 +14,7 @@ class ConstraintPipeline:
         if proposal.is_done():
             return Decision.ALLOW, ""
 
-        tool_def = self.registry.get(proposal.tool_id)
+        tool_def = self.registry.get(proposal.tool_id or "")
         if not tool_def:
             return Decision.REJECT, f"Unknown tool: {proposal.tool_id}"
 

@@ -1,4 +1,4 @@
-"""Append-only event log. Single writer per session."""
+"""Append-only event log: single writer per session (in-memory default)."""
 
 from typing import Any
 
@@ -6,7 +6,11 @@ from .model import Event
 
 
 class EventLog:
-    """Append-only log keyed by session_id. In-memory for the example."""
+    """
+    Append-only log keyed by ``session_id``.
+
+    Swap for Postgres/SQLite/event store in production; keep the same interface.
+    """
 
     def __init__(self) -> None:
         self._entries: dict[str, list[Event]] = {}
@@ -17,7 +21,7 @@ class EventLog:
         self._entries[session_id].append(event)
 
     def read(self, session_id: str) -> list[Event]:
-        return self._entries.get(session_id, [])
+        return list(self._entries.get(session_id, []))
 
     def read_as_dicts(self, session_id: str) -> list[dict[str, Any]]:
         return [e.to_log_line() for e in self.read(session_id)]
