@@ -35,11 +35,11 @@
                                ▼
                      ┌───────────────────┐
                      │      LLMs         │
-                     │  (Proposers only)  │
-                     │ - Receive prompts │
-                     │ - Propose tool    │
-                     │   calls / actions │
-                     │ - Stateless       │
+                     │ Agent: Proposer   │
+                     │ (each step)       │
+                     │ Optional: Classi- │
+                     │ fier (session     │
+                     │ start)            │
                      └───────────────────┘
 ```
 
@@ -74,8 +74,33 @@ Use server execution when you need strict reproducibility and control. Use clien
 |-----------|------|
 | **Client** | Sends requests, receives output/events. May be thin (request/response only) or **thick** (executes tools locally and reports back, Cursor-style). Never bypasses the control plane for decisions or logging. |
 | **Control Plane** | Loop runtime. Owns: receive proposal → apply constraints → decide run vs reject → dispatch to server or client → log decision + outcome → next step. Single authority for what runs and single owner of the event log. |
-| **LLMs** | Proposers only. Stateless. Receive prompts, propose tool calls or actions. Do not execute. |
+| **LLMs** | **Agent** via **Proposer** (each step). Optional **Classifier** at session start. Do not execute tools inside the model — execution is after policy. |
 | **Tools** | Execution layer. May run on **server** (control plane or backend) or **client** (client executes and reports). Registry describes venue and semantics; control plane enforces policy for both. |
+
+---
+
+## Two LLM roles (agent vs classification)
+
+The library does **not** embed a model server. Two different integrations are common:
+
+| Role | Typical API | When it runs | Purpose |
+|------|-------------|--------------|---------|
+| **Agent** | Your **`Proposer`** implementation (e.g. OpenAI `chat.completions` with `tools`) | **Every step** of the loop | Propose the next tool call or signal **done** (`Proposal`). |
+| **Classifier** (optional) | **`Classifier`** / **`OpenAIClassifier`** / **`CallableClassifier`** | **Once** at session start (before steps) | Emit a **label**; **`ClassificationPolicyRegistry`** resolves **profile** + merged **trace_requirements**. |
+
+The **agent** is where the **main** LLM runs (tool loop). The **classifier** is a separate, usually smaller call for task routing. You can use the same provider and model for both, or not — it’s wiring, not a requirement.
+
+**`LoopRunner`** passes **`session`** into **`Proposer.propose(..., session=session)`** so the agent can read **`session.classification`** and **`session.effective_trace_requirements`** (set by the control plane) **without** re-running classification or keyword heuristics in application code.
+
+---
+
+## Where profiles live (`bug_profile`, `write_profile`, …)
+
+- **`ProfileConfig`** objects keyed by name on **`ToolRegistry`** (e.g. `"bug_profile"`, `"write_profile"`). Each profile lists **allowed `tools`**, **harness** (`max_steps`, `proposal_n`, consensus, no-consensus retries), and **trace_requirements** (minimum successful tool executions per **tag** on `ToolDef`).
+- **Serialization** — Same data as **JSON**: `profile_to_json` / `profile_from_json`, or a **bundle** `{"profiles": { "name": { ... } } }` via `load_profile_bundle` / `dump_profile_bundle`. Good for git and review.
+- **Label → profile** — **`ClassificationPolicyRegistry`** holds **`PolicyRule`** entries: `profile` name + optional **`trace_requirements`** overrides (merged on top of the profile). This map is **Python today**; load your own JSON at startup if you want a file-driven policy table.
+
+Policy encodes **constraints** (allowlists, harness, **minimum evidence before** `done`). It does **not** encode a scripted step sequence (“turn 1 search, turn 2 search”) — the agent proposes freely; **trace_requirements** enforce **what must be true** on the log before termination.
 
 ---
 
@@ -127,7 +152,8 @@ Stochasticity lives at the proposal layer; determinism and control live in the c
 
 ## Optional Enhancements
 
-- **Profiles / tool bundles** — Attach capability sets per client or request (e.g. safe_default, full_access).
+- **Profiles / tool bundles** — Shipped: **`ProfileConfig`** on **`ToolRegistry`**, JSON bundle helpers, **trace_requirements** + **`ToolDef.tags`**, optional **classification** + **`PolicyRule`**.
+- **JSON for classification rules** — File-driven loader for `ClassificationPolicyRegistry` (not in the library yet; construct from your own JSON).
 - **Hookable prompt augmentation** — Pre/post system hooks for reasoning directives (e.g. “terminate after N steps”).
 - **Idempotent tool execution** — Tools declare whether repeated calls with same inputs are safe; simplifies replay and determinism.
 
@@ -228,23 +254,33 @@ So: **like Kubernetes, we have one control plane and delegated execution; like K
 
 How to build the control plane and integrate it with clients and tools.
 
+### Reference implementation (Python library)
+
+This repository ships **`toolcallcontrol`** (`src/toolcallcontrol/`): `LoopRunner`, `EventLog`, `ToolRegistry` with **`ProfileConfig`** (harness + **trace_requirements**), `ConstraintPipeline`, pluggable **`Proposer`** (agent LLM), optional **`Classifier`** / **`OpenAIClassifier`**, **`ClassificationPolicyRegistry`**, optional `majority_aggregate`, and `execute` for server vs client venues. Install with `pip install toolcallcontrol` (or `pip install -e .` from source). Run `python -m toolcallcontrol` for a demo session; see **`examples/full_agent_example.py`** for agent + classifier wiring. The table below maps concepts to that package; names may differ slightly in other languages.
+
 ### Core abstractions
 
 | Component | Responsibility | Key interface |
 |-----------|----------------|----------------|
 | **Session** | One run of the loop (request → done or capped). Holds request, profile, tool set, and reference to the event log. | `create(request, profile) → session_id` |
 | **Loop runner** | For each step: get proposal(s) → optionally aggregate → apply constraints → dispatch execution → log → decide next (continue/done/reject). | `step(session_id) → next_action` |
-| **Proposer** | Call LLM(s) with current prompt/context; return one or N tool-call proposals (tool_id, args). Stateless. | `propose(prompt, tools_spec, n=1) → [Proposal]` |
+| **Proposer** | **Agent LLM**: call with current prompt/context; return one or N tool-call proposals (tool_id, args). Receives optional **`session`** (classification + trace policy). | `propose(prompt, context, tool_ids, n=1, session=None) → [Proposal]` |
+| **Classifier** (optional) | **`OpenAIClassifier`** or custom **`Classifier`**: label for policy. | `classify(request) → ClassificationResult` |
+| **Policy registry** (optional) | **`ClassificationPolicyRegistry`**: label → **`PolicyRule`** (profile + trace overrides). | `resolve(label) → PolicyRule` |
 | **Aggregator** (optional) | Take N proposals, return consensus (e.g. majority) or “no consensus.” | `aggregate(proposals, policy) → AcceptedProposal | NoConsensus` |
 | **Constraint pipeline** | Allowlist/denylist, rate limits, dry-run, venue checks. Input: accepted proposal. Output: allow | reject (reason). | `check(proposal, session) → Allow | Reject` |
 | **Tool registry** | Map tool_id → definition (args schema, venue: server | client, idempotency). | `get(tool_id) → ToolDef`; `list(profile) → [ToolDef]` |
 | **Executor** | Run tool on server (control plane calls impl) or send “approved call” to client and wait for reported outcome. | `execute(proposal, venue) → Outcome` (server) or `dispatch_to_client(proposal) → later Outcome` |
 | **Event log** | Append-only. Each entry: step_id, proposal, decision (allow/reject), outcome (if executed), venue, timestamp. | `append(entry)`; `read(session_id) → [Entry]`; `replay(session_id) → re-run server steps` |
 
+### Data flow (session start)
+
+If **`classifier`** and **`policy_registry`** are set: **classify** request → set **`session.profile`** and **`session.effective_trace_requirements`** → append **classification** event to log. Harness (**`max_steps`**, **`proposal_n`**, …) is read from the resolved profile.
+
 ### Data flow (one step)
 
 1. **Build context** — Conversation + tool results so far; tool list for this session (from registry + profile).
-2. **Propose** — Call proposer (same prompt, N times if using consensus). Get one or N proposals.
+2. **Propose** — Call **agent** proposer (same prompt, N times if using consensus). Get one or N proposals. If proposal is **done**, enforce **trace_requirements** on the log before allowing termination.
 3. **Aggregate** (if N > 1) — Run aggregator; if no consensus, apply policy (retry / escalate / reject) and log.
 4. **Constrain** — Run constraint pipeline on accepted proposal. If reject, log and optionally feed back to loop (e.g. “tool not allowed” in next prompt).
 5. **Execute** — If allow: lookup venue from registry; if server, run tool and get outcome; if client, send approved call to client, wait for reported outcome.

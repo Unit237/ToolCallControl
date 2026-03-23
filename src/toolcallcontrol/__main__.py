@@ -1,16 +1,13 @@
-#!/usr/bin/env python3
-"""
-Example: run one session through the control plane.
-  propose -> constrain -> execute -> log  until done or max_steps.
+"""``python -m toolcallcontrol`` — print one demo session and event log."""
 
-Run from project root:  python -m example.main
-"""
+from __future__ import annotations
 
 import json
-from .event_log import EventLog
-from .tool_registry import ToolRegistry
+
 from .constraint_pipeline import ConstraintPipeline
+from .event_log import EventLog
 from .loop import LoopRunner
+from .tool_registry import ToolRegistry
 
 
 def main() -> None:
@@ -27,11 +24,11 @@ def main() -> None:
 
     result = runner.run(session)
 
-    print("Session:", result["session_id"])
-    print("Steps:", result["steps"])
-    print("\nEvent log (append-only):")
+    print("ToolCallControl demo session")
+    print("session_id:", result["session_id"])
+    print("steps:", result["steps"])
+    print("\nAppend-only event log:")
     print(json.dumps(result["log"], indent=2))
-    print("\nFinal context length:", len(result["final_context"]))
 
 
 if __name__ == "__main__":
